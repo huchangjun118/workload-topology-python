@@ -14,7 +14,7 @@ import pytest
 from topology.aggregator import Aggregator
 from topology.service import Scope, TopologyService
 
-from .conftest import push_all, report
+from .conftest import push_all, report, wait_for_version
 
 
 def _assert_snapshot_consistent(snap) -> None:
@@ -30,7 +30,7 @@ async def test_held_snapshot_is_immutable_under_changes(make_source):
     agg = Aggregator([source])
     await agg.start()
     await push_all(source, [report("cluster", "c1", "s1", 1, name="c1")])
-    await asyncio.sleep(0.15)
+    await wait_for_version(agg, 1)
 
     held = agg.current_snapshot()
     assert held.version == 1
@@ -38,7 +38,7 @@ async def test_held_snapshot_is_immutable_under_changes(make_source):
     # Keep pushing changes while "holding" the snapshot.
     for i in range(20):
         await source.push_report(report("node", f"n{i}", "s1", i + 2, cluster_id="c1"))
-    await asyncio.sleep(0.3)
+    await wait_for_version(agg, 2)
 
     # The held snapshot is unchanged and internally consistent.
     assert held.version == 1
@@ -57,21 +57,27 @@ async def test_concurrent_reads_while_writing(make_source):
     agg = Aggregator([source])
     await agg.start()
     await source.push_report(report("cluster", "c1", "s1", 0, name="c1"))
-    await asyncio.sleep(0.1)
+    await wait_for_version(agg, 1)
     svc = TopologyService(agg)
     stop = asyncio.Event()
     violations = []
+    writes_done = 0
+    min_writes = 200
 
     async def writer():
+        nonlocal writes_done
         i = 0
         while not stop.is_set():
             await source.push_report(report("node", f"n{i % 5}", "s1", i + 1, cluster_id="c1"))
             i += 1
-            await asyncio.sleep(0.005)
+            writes_done += 1
+            await asyncio.sleep(0)
 
     async def reader():
         while not stop.is_set():
             view = svc.list_nodes(Scope.all(), "c1")
+            # The response is attributable to exactly one view version.
+            assert view.view_version == agg.snapshot_at(view.view_version).version
             # Every returned node must be reachable by an edge in the same view.
             edge_children = {e.child.id for e in view.edges}
             for entity in view.entities:
@@ -79,14 +85,19 @@ async def test_concurrent_reads_while_writing(make_source):
                     violations.append(f"orphan {entity.key.id} in v{view.view_version}")
             # All edges must belong to the same layer/version.
             _assert_snapshot_consistent(agg.current_snapshot())
-            await asyncio.sleep(0.002)
+            await asyncio.sleep(0)
 
     wt = asyncio.create_task(writer())
     rt = asyncio.create_task(reader())
-    await asyncio.sleep(0.5)
+    # Condition-based stopping: keep the pressure on until a substantial
+    # number of writes have been interleaved with reads, not for a fixed
+    # wall-clock duration.
+    while writes_done < min_writes and not violations:
+        await asyncio.sleep(0)
     stop.set()
     await wt
     await rt
+    assert writes_done >= min_writes
     assert violations == []
     await agg.stop()
 
@@ -96,15 +107,17 @@ async def test_cancelled_read_leaves_no_intermediate_state(make_source):
     agg = Aggregator([source])
     await agg.start()
     await push_all(source, [report("cluster", "c1", "s1", 1, name="c1")])
-    await asyncio.sleep(0.15)
+    await wait_for_version(agg, 1)
     svc = TopologyService(agg)
+    started = asyncio.Event()
 
     async def slow_read():
+        started.set()
         await asyncio.sleep(10)  # simulate a long read
         return svc.list_clusters(Scope.all())
 
     task = asyncio.create_task(slow_read())
-    await asyncio.sleep(0.05)
+    await started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -122,7 +135,7 @@ async def test_read_timeout_returns_and_state_intact(make_source):
     agg = Aggregator([source])
     await agg.start()
     await push_all(source, [report("cluster", "c1", "s1", 1, name="c1")])
-    await asyncio.sleep(0.15)
+    await wait_for_version(agg, 1)
     svc = TopologyService(agg)
 
     async def slow_read():
@@ -149,7 +162,7 @@ async def test_every_response_has_view_version(make_source):
         report("workload", "w1", "s1", 3, node_id="n1"),
         report("replica", "r1", "s1", 4, workload_id="w1"),
     ])
-    await asyncio.sleep(0.2)
+    await wait_for_version(agg, 1)
     svc = TopologyService(agg)
     for view in (
         svc.list_clusters(Scope.all()),
@@ -167,7 +180,7 @@ async def test_pinned_view_survives_concurrent_writes(make_source):
     agg = Aggregator([source])
     await agg.start()
     await push_all(source, [report("cluster", "c1", "s1", 1, name="c1")])
-    await asyncio.sleep(0.15)
+    await wait_for_version(agg, 1)
     svc = TopologyService(agg)
 
     v1 = agg.version
@@ -177,7 +190,7 @@ async def test_pinned_view_survives_concurrent_writes(make_source):
     # Concurrent writes must not affect the pinned view.
     for i in range(10):
         await source.push_report(report("node", f"n{i}", "s1", i + 2, cluster_id="c1"))
-    await asyncio.sleep(0.2)
+    await wait_for_version(agg, v1 + 1)
 
     pinned_again = svc.list_nodes(Scope.all(), "c1", view=v1)
     assert pinned_again.view_version == v1

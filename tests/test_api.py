@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
-import pytest
 from fastapi.testclient import TestClient
 
 from topology.aggregator import Aggregator
 from topology.api import create_app
-from topology.service import Scope
 
 from .conftest import full_topology, push_all
 
@@ -22,6 +21,23 @@ def _make_client(sources):
 
 async def _seed(source):
     await push_all(source, full_topology("s1"))
+
+
+def _poll_until(fn, timeout: float = 5.0, interval: float = 0.02):
+    """Call ``fn`` until it returns a truthy value or the deadline.
+
+    Bounded polling (not a fixed sleep): it returns as soon as the
+    simulated failure/ recovery has actually been published, so it is
+    independent of machine speed while still failing loudly on a hang.
+    """
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = fn()
+        if last:
+            return last
+        time.sleep(interval)
+    raise AssertionError(f"condition not met before timeout (last={last!r})")
 
 
 def test_drill_down_endpoints(make_source):
@@ -77,18 +93,23 @@ def test_source_control_endpoints(make_source):
         assert r.status_code == 200
         assert r.json()["failed"] is True
 
-        # Wait for the fail timeout, then the source is reported dead.
-        import time
-        time.sleep(0.6)
-        r = client.get("/api/sources")
-        assert r.json()["sources"][0]["state"] == "dead"
+        # Wait (bounded) until the fail timeout has actually been
+        # published, instead of guessing with a fixed sleep.
+        def _dead():
+            r = client.get("/api/sources")
+            return r.json()["sources"][0]["state"] == "dead"
+
+        assert _poll_until(_dead)
 
         # Recover.
         r = client.post("/api/sources/s1/recover")
         assert r.status_code == 200
-        time.sleep(0.3)
-        r = client.get("/api/sources")
-        assert r.json()["sources"][0]["state"] == "alive"
+
+        def _alive():
+            r = client.get("/api/sources")
+            return r.json()["sources"][0]["state"] == "alive"
+
+        assert _poll_until(_alive)
 
 
 def test_pinned_view_via_query_param(make_source):

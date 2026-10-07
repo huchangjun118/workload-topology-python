@@ -16,6 +16,11 @@ Merge rules (deterministic, arrival-order independent):
 Snapshots are built synchronously in one non-interruptible step and
 published by swapping a single reference, so cancellation can never leave
 the aggregation in an intermediate state.
+
+Callers that need to synchronize on published state (instead of sleeping
+for a guessed delay) can use :meth:`wait_for_version`,
+:meth:`wait_for_source_state` and :meth:`wait_until`; these wake on every
+publication and are themselves safe to cancel.
 """
 
 from __future__ import annotations
@@ -68,6 +73,9 @@ class Aggregator:
         self._snapshot: Snapshot = self._empty_snapshot(0)
         self._version = 0
         self._lock = asyncio.Lock()
+        # Signalled after every snapshot publication so callers (and tests)
+        # can wait for concrete versions instead of guessing with sleeps.
+        self._condition = asyncio.Condition()
         self._task: asyncio.Task[None] | None = None
         self._pump_tasks: list[asyncio.Task[None]] = []
         self._stop = asyncio.Event()
@@ -101,6 +109,58 @@ class Aggregator:
         """
         return self._history.get(version)
 
+    async def wait_until(
+        self, predicate, timeout: float = 5.0
+    ) -> bool:
+        """Wait until ``predicate(snapshot)`` is true.
+
+        Wakes on every snapshot publication (including liveness-only
+        changes), so callers wait for an actual state condition instead
+        of relying on fixed wall-clock delays. Returns False on timeout.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        async with self._condition:
+            while not predicate(self._snapshot):
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+                try:
+                    await asyncio.wait_for(self._condition.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    pass  # re-check predicate / deadline below
+            return predicate(self._snapshot)
+
+    async def wait_for_version(self, version: int, timeout: float = 5.0) -> None:
+        """Wait until at least ``version`` has been published.
+
+        Raises ``asyncio.TimeoutError`` if it does not happen in time;
+        the exception is used (rather than a bool return) so callers can
+        compose the wait with ``asyncio.wait_for`` cancellation semantics.
+        """
+        ok = await self.wait_until(lambda snap: snap.version >= version, timeout)
+        if not ok:
+            raise asyncio.TimeoutError(
+                f"view version {version} never reached (at {self._version})"
+            )
+
+    async def wait_for_source_state(
+        self, source_id: str, state: SourceState, timeout: float = 5.0
+    ) -> None:
+        """Wait until a source is reported with the given liveness state."""
+
+        def _state(snap: Snapshot) -> bool:
+            health = snap.source_health.get(source_id)
+            return health is not None and health.state is state
+
+        ok = await self.wait_until(_state, timeout)
+        if not ok:
+            current = self._snapshot.source_health.get(source_id)
+            raise asyncio.TimeoutError(
+                f"source {source_id!r} never reached {state.value!r}"
+                f" (at {current.state.value if current else 'unknown'})"
+            )
+
     @staticmethod
     def _empty_snapshot(version: int) -> Snapshot:
         return Snapshot(
@@ -128,6 +188,9 @@ class Aggregator:
     async def stop(self) -> None:
         """Stop consuming and close all source pipes."""
         self._stop.set()
+        # Release anyone parked in wait_until so shutdown can never hang.
+        async with self._condition:
+            self._condition.notify_all()
         if self._task is not None:
             self._task.cancel()
             try:
@@ -169,16 +232,19 @@ class Aggregator:
                         events.append(self._shared_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
-            self._apply_events(events)
+            if self._apply_events(events):
+                await self._publish_notify()
 
     # -- merge (synchronous, non-interruptible) ----------------------------
 
-    def _apply_events(self, events: list[PipeEvent]) -> None:
+    def _apply_events(self, events: list[PipeEvent]) -> bool:
         """Apply a batch of events and publish a new snapshot.
 
         Synchronous on purpose: there are no ``await`` points between
         reading the per-source state and swapping the snapshot reference,
         so task cancellation can never interrupt a merge half-way.
+
+        Returns True when a new snapshot was published.
         """
         state_changed = False
         for event in events:
@@ -199,7 +265,7 @@ class Aggregator:
 
         liveness = self._compute_liveness()
         if not state_changed and liveness == self._last_liveness:
-            return
+            return False
 
         self._version += 1
         self._snapshot = self._build_snapshot(self._version, liveness)
@@ -208,6 +274,17 @@ class Aggregator:
         if len(self._history) > self._max_history:
             oldest = min(self._history)
             del self._history[oldest]
+        return True
+
+    async def _publish_notify(self) -> None:
+        """Wake version/state waiters under the condition lock.
+
+        Notification is kept out of the synchronous merge itself (which
+        must stay non-interruptible); by the time waiters wake and
+        re-check their predicate the new snapshot is fully published.
+        """
+        async with self._condition:
+            self._condition.notify_all()
 
     def _compute_liveness(self) -> dict[str, SourceState]:
         now = time.monotonic_ns()

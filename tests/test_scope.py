@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-import asyncio
 
 from topology.aggregator import Aggregator
+from topology.model import SourceState
 from topology.service import ForbiddenError, NotFoundError, Scope, TopologyService
 
-from .conftest import full_topology, push_all, report
+from .conftest import (
+    full_topology,
+    push_all,
+    report,
+    wait_for_source_state,
+    wait_for_version,
+)
 
 
 async def _service(make_source):
@@ -15,7 +21,7 @@ async def _service(make_source):
     agg = Aggregator([source])
     await agg.start()
     await push_all(source, full_topology("s1"))
-    await asyncio.sleep(0.2)
+    await wait_for_version(agg, 1)
     return agg, TopologyService(agg)
 
 
@@ -24,7 +30,7 @@ async def test_scope_filters_clusters(make_source):
     # Add a second cluster.
     source = agg._sources["s1"]
     await source.push_report(report("cluster", "c2", "s1", 10, name="c2"))
-    await asyncio.sleep(0.15)
+    await wait_for_version(agg, agg.version + 1)
 
     view = svc.list_clusters(Scope(visible_clusters=frozenset({"c1"})))
     assert [e.key.id for e in view.entities] == ["c1"]
@@ -39,7 +45,7 @@ async def test_scope_filters_entire_subtree(make_source):
     await source.push_report(report("node", "n3", "s1", 11, cluster_id="c2"))
     await source.push_report(report("workload", "w3", "s1", 12, node_id="n3"))
     await source.push_report(report("replica", "r4", "s1", 13, workload_id="w3"))
-    await asyncio.sleep(0.15)
+    await wait_for_version(agg, agg.version + 1)
 
     scope = Scope(visible_clusters=frozenset({"c1"}))
     clusters = svc.list_clusters(scope)
@@ -122,7 +128,7 @@ async def test_pinned_view_is_consistent(make_source):
     # Push a change; the pinned view must remain unchanged.
     source = agg._sources["s1"]
     await source.push_report(report("cluster", "c2", "s1", 10, name="c2"))
-    await asyncio.sleep(0.15)
+    await wait_for_version(agg, agg.version + 1)
     pinned_after = svc.list_clusters(Scope.all(), view=v1)
     assert pinned_after.view_version == v1
     assert [e.key.id for e in pinned_after.entities] == ["c1"]
@@ -137,9 +143,9 @@ async def test_stale_entity_still_returned_with_status(make_source):
     await agg.start()
     await s1.push_report(report("cluster", "c1", "s1", 1, name="c1"))
     await s2.push_report(report("node", "n1", "s2", 1, cluster_id="c1"))
-    await asyncio.sleep(0.2)
+    await wait_for_version(agg, 1)
     await s2.fail()
-    await asyncio.sleep(0.5)
+    await wait_for_source_state(agg, "s2", SourceState.DEAD)
     svc = TopologyService(agg)
     nodes = svc.list_nodes(Scope.all(), "c1")
     assert len(nodes.entities) == 1

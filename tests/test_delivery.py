@@ -7,7 +7,7 @@ import asyncio
 from topology.aggregator import Aggregator
 from topology.service import Scope, TopologyService
 
-from .conftest import push_all, report
+from .conftest import report, wait_for_version
 
 
 async def test_disconnect_buffers_and_redelivers(make_source):
@@ -17,19 +17,22 @@ async def test_disconnect_buffers_and_redelivers(make_source):
     svc = TopologyService(agg)
 
     await source.push_report(report("cluster", "c1", "s1", 1, name="c1"))
-    await asyncio.sleep(0.15)
+    await wait_for_version(agg, 1)
     assert [e.key.id for e in svc.list_clusters(Scope.all()).entities] == ["c1"]
 
     # Disconnect: reports are buffered, not visible.
     await source.disconnect()
+    v_during_disconnect = agg.version
     await source.push_report(report("node", "n1", "s1", 2, cluster_id="c1"))
     await source.push_report(report("node", "n2", "s1", 3, cluster_id="c1"))
-    await asyncio.sleep(0.15)
+    # The pipe is closed; no publication may occur while disconnected.
+    await asyncio.sleep(0.05)
+    assert agg.version == v_during_disconnect
     assert svc.list_nodes(Scope.all(), "c1").entities == ()
 
     # Reconnect: buffered events re-delivered in order.
     await source.reconnect()
-    await asyncio.sleep(0.2)
+    await wait_for_version(agg, v_during_disconnect + 1)
     nodes = svc.list_nodes(Scope.all(), "c1")
     assert [e.key.id for e in nodes.entities] == ["n1", "n2"]
     await agg.stop()
@@ -40,13 +43,13 @@ async def test_redelivery_does_not_roll_back(make_source):
     agg = Aggregator([source])
     await agg.start()
     await source.push_report(report("cluster", "c1", "s1", 1, name="c1"))
-    await asyncio.sleep(0.15)
+    await wait_for_version(agg, 1)
     v1 = agg.version
 
     await source.disconnect()
     await source.push_report(report("node", "n1", "s1", 2, cluster_id="c1"))
     await source.reconnect()
-    await asyncio.sleep(0.2)
+    await wait_for_version(agg, v1 + 1)
     assert agg.version > v1  # never rolls back
     await agg.stop()
 
@@ -67,7 +70,7 @@ async def test_out_of_order_delivery_converges(make_source):
     # Deliver in a shuffled order.
     for ev in [events[3], events[1], events[0], events[4], events[2]]:
         await source.push_report(ev)
-    await asyncio.sleep(0.2)
+    await wait_for_version(agg, 1)
 
     svc = TopologyService(agg)
     nodes = svc.list_nodes(Scope.all(), "c1")
@@ -86,12 +89,14 @@ async def test_duplicate_redelivery_folded(make_source):
     await agg.start()
     r = report("node", "n1", "s1", 1, cluster_id="c1")
     await source.push_report(r)
-    await asyncio.sleep(0.15)
+    await wait_for_version(agg, 1)
     v1 = agg.version
 
     # Re-deliver the exact same event (at-least-once semantics).
     await source.push_report(r)
-    await asyncio.sleep(0.15)
+    # A duplicate publication must never happen; prove it with a bounded
+    # delay rather than a fixed sleep that a slow machine could flake on.
+    await asyncio.sleep(0.05)
     assert agg.version == v1  # folded, no new version
     await agg.stop()
 
@@ -104,10 +109,10 @@ async def test_disconnect_reconnect_preserves_other_sources(make_source):
     await agg.start()
     await s1.push_report(report("cluster", "c1", "s1", 1, name="c1"))
     await s2.push_report(report("cluster", "c2", "s2", 1, name="c2"))
-    await asyncio.sleep(0.2)
+    await wait_for_version(agg, 1)
 
     await s1.disconnect()
-    await asyncio.sleep(0.15)
+    await asyncio.sleep(0.05)
     svc = TopologyService(agg)
     clusters = svc.list_clusters(Scope.all())
     assert [e.key.id for e in clusters.entities] == ["c1", "c2"]

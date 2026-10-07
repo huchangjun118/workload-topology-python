@@ -16,6 +16,29 @@ from topology.model import (
 from topology.sources import DataSource, SourceConfig
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Treat skipped tests as failures.
+
+    The acceptance criteria require every collected test to actually
+    execute. A skip (including an async test that pytest would collect
+    but not await if its async plugin were missing) must therefore fail
+    the run loudly instead of being reported as a quiet "s" / "passed".
+    """
+    outcome = yield
+    report = outcome.get_result()
+    if call.when in ("setup", "call") and report.skipped:
+        reason = str(getattr(call.excinfo, "value", "") or "unknown reason")
+        report.outcome = "failed"
+        report.longrepr = (
+            str(item.fspath),
+            0,
+            f"test was skipped, but this project does not allow silent skips "
+            f"(check the pytest-asyncio setup): {reason}",
+        )
+        report.wasxfail = None
+
+
 @pytest.fixture
 def make_source():
     """Factory for in-memory data sources with a short fail timeout."""
@@ -70,12 +93,18 @@ async def push_all(source: DataSource, reports) -> None:
         await source.push_report(r)
 
 
-async def wait_for_version(agg: Aggregator, min_version: int, timeout: float = 2.0) -> None:
-    """Wait until the aggregator publishes at least ``min_version``."""
-    import asyncio
+async def wait_for_version(agg: Aggregator, min_version: int, timeout: float = 5.0) -> None:
+    """Wait until the aggregator publishes at least ``min_version``.
 
-    deadline = asyncio.get_event_loop().time() + timeout
-    while agg.version < min_version:
-        if asyncio.get_event_loop().time() > deadline:
-            raise TimeoutError(f"version {min_version} never reached (at {agg.version})")
-        await asyncio.sleep(0.02)
+    Backed by the aggregator's condition variable: it wakes only on real
+    publications, so no fixed wall-clock sleeps or machine-speed
+    assumptions are involved. The generous timeout is a safety net only.
+    """
+    await agg.wait_for_version(min_version, timeout=timeout)
+
+
+async def wait_for_source_state(
+    agg: Aggregator, source_id: str, state, timeout: float = 5.0
+) -> None:
+    """Wait until a source's published health reaches ``state``."""
+    await agg.wait_for_source_state(source_id, state, timeout=timeout)
