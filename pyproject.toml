@@ -4,7 +4,9 @@ version = "0.1.0"
 requires-python = ">=3.14.4"
 dependencies = [
     "fastapi[standard]>=0.141.1",
+    "httpx>=0.28.1",
     "pytest>=8.0",
+    "pytest-asyncio>=1.4.0",
 ]
 
 [[tool.uv.index]]
@@ -15,3 +17,6 @@ default = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+# Fail loudly on unknown config options (e.g. asyncio_mode when
+# pytest-asyncio is missing) instead of silently skipping async tests.
+addopts = "--strict-config --strict-markers"

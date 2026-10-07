@@ -114,6 +114,32 @@ authorization outcomes are deliberately distinguished:
 * Server-side reads are bounded by `READ_TIMEOUT_S`; a timeout returns
   `504 read_timeout` and leaves the aggregator state intact.
 
+## Concurrency semantics (acceptance criteria)
+
+The concurrency acceptance tests in `tests/test_concurrency.py` pin down
+the following guarantees. They hold at increased source/entity scale and
+under read-heavy continuous pressure, and they are verified with
+condition-based synchronization (view versions and health states with a
+generous deadline) instead of fixed sleeps, so they are stable across
+machines and repeated runs.
+
+* **Reads during continuous writes.** While every source keeps writing,
+  each response is attributable to exactly one consistent view version:
+  `view_version` resolves to a snapshot in the version history, and the
+  entities/edges in the response match that snapshot. The version
+  observed by any single reader never goes backwards (no rollback).
+* **Cancellation and timeout.** Cancelling or timing out an in-flight
+  read never leaves half-built state: the current snapshot and every
+  retained history snapshot stay internally consistent (no orphan
+  entities, no dangling edges), and the aggregator keeps publishing new
+  versions afterwards.
+* **Failure, staleness and recovery.** When one source fails, exactly
+  the entities it solely covers flip to `stale`; entities corroborated
+  by other alive sources stay `active` and fully readable. When the
+  source recovers, its resumed heartbeats flip the liveness back and the
+  `stale` markers clear automatically in the next published view — no
+  manual resend or restart is needed.
+
 ## API
 
 | Method | Path | Description |
@@ -133,15 +159,46 @@ All layer endpoints accept `clusters` (scope) and `view` (pinned version).
 
 ## Running
 
+### Prerequisites
+
+* [uv](https://docs.astral.sh/uv/) — the only tool you need to install
+  yourself. uv automatically provisions the required Python interpreter
+  (`requires-python = ">=3.14.4"` in `pyproject.toml`) on first use; no
+  system Python, system packages or manual `pip install` steps are
+  needed.
+
+### Install and verify (from a clean checkout)
+
 ```bash
-# install dependencies
+# install dependencies exactly as locked in uv.lock
 uv sync
+
+# run the tests (must pass in one go)
+uv run pytest
 
 # run the service (demo topology with two in-memory sources)
 uv run python main.py
-
-# run the tests
-uv run pytest
 ```
 
+`uv sync` is idempotent: it creates `.venv` from `pyproject.toml` +
+`uv.lock`, and re-running it on an existing environment converges to the
+same locked package set. Deleting `.venv` and re-running `uv sync`
+rebuilds the identical environment from scratch. Never commit or reuse a
+`.venv` copied from another machine or another project — the entry-point
+scripts inside it embed absolute interpreter paths.
+
 The interactive API docs are available at `/docs` when the service runs.
+
+### Test suite notes
+
+* All tests are `async def` and run through **pytest-asyncio** in
+  `asyncio_mode = "auto"` (declared in `pyproject.toml`; both `pytest`
+  and `pytest-asyncio` are locked in `uv.lock`, so `uv sync` installs
+  everything the suite needs — no extra packages).
+* `addopts = "--strict-config --strict-markers"` makes the run fail
+  loudly if the async plugin is missing (unknown `asyncio_mode` option)
+  instead of silently skipping the async tests.
+* The concurrency tests synchronize on view versions / health states
+  with deadlines, never on fixed wait durations, so the whole suite
+  passes deterministically on slow and fast machines and across repeated
+  runs (e.g. `for i in 1 2 3; do uv run pytest; done`).
